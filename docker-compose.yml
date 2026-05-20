@@ -1,0 +1,9 @@
+services:
+  waffle-meter-notifier:
+    build: .
+    container_name: waffle-meter-notifier
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
