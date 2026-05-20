@@ -368,8 +368,14 @@ def build_install_embed(latest: ReleaseInfo, npcap: NpcapInfo) -> discord.Embed:
 
 class WaffleMeterBot(discord.Client):
     def __init__(self, config: Config) -> None:
-        intents = discord.Intents.default()
-        super().__init__(intents=intents)
+        intents = discord.Intents.none()
+        intents.guilds = True
+        super().__init__(
+            intents=intents,
+            max_messages=None,
+            member_cache_flags=discord.MemberCacheFlags.none(),
+            chunk_guilds_at_startup=False,
+        )
         self.config = config
         self.store = StateStore(config.state_file, config.db_file)
         self.tree = app_commands.CommandTree(self)
