@@ -1,7 +1,7 @@
 services:
-  waffle-meter-notifier:
+  waffle-meter-bot:
     build: .
-    container_name: waffle-meter-notifier
+    container_name: waffle-meter-bot
     restart: unless-stopped
     env_file:
       - .env
