@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import json
 import os
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
 import discord
@@ -24,7 +21,6 @@ DEFAULT_CHECK_INTERVAL_SECONDS = 600
 DEFAULT_STATE_FILE = "/data/state.json"
 DEFAULT_DB_FILE = "/data/bot.db"
 GITHUB_API_BASE = "https://api.github.com"
-NPCAP_DOWNLOAD_PAGE = "https://npcap.com/#download"
 USER_AGENT = "waffle-meter-discord-bot/1.0"
 EMBED_COLOR = 0x4F8CC9
 
@@ -51,37 +47,7 @@ class ReleaseInfo:
     download_url: str
     published_at: str
     prerelease: bool
-
-
-@dataclass(frozen=True)
-class NpcapInfo:
-    version: str
-    installer_url: str
-
-
-class NpcapLinkParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self._current_href: str | None = None
-        self.matches: list[tuple[str, str]] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag != "a":
-            return
-        attrs_dict = dict(attrs)
-        self._current_href = attrs_dict.get("href")
-
-    def handle_data(self, data: str) -> None:
-        if not self._current_href:
-            return
-        text = " ".join(html.unescape(data).split())
-        match = re.search(r"\bNpcap\s+([0-9]+(?:\.[0-9]+)*)\s+installer\b", text, re.I)
-        if match:
-            self.matches.append((match.group(1), self._current_href))
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "a":
-            self._current_href = None
+    body: str
 
 
 class StateStore:
@@ -244,16 +210,25 @@ def pick_download_url(release: dict[str, Any]) -> str:
     if not assets:
         return release["html_url"]
 
-    preferred_extensions = (".msi", ".exe", ".zip")
-
     def score(asset: dict[str, Any]) -> tuple[int, str]:
         name = str(asset.get("name", "")).lower()
-        for index, extension in enumerate(preferred_extensions):
-            if name.endswith(extension):
-                return (index, name)
-        return (len(preferred_extensions), name)
+        if name == "waffle_meter-win-setup.exe":
+            return (0, name)
+        if name.endswith("setup.exe"):
+            return (1, name)
+        if name == "waffle_meter-win-portable.zip":
+            return (2, name)
+        if name.endswith(".nupkg") or name in {"releases", "releases.win.json"}:
+            return (99, name)
+        if name.endswith(".exe"):
+            return (3, name)
+        if name.endswith(".zip"):
+            return (4, name)
+        return (98, name)
 
     selected = sorted(assets, key=score)[0]
+    if score(selected)[0] >= 98:
+        return release["html_url"]
     return selected.get("browser_download_url") or release["html_url"]
 
 
@@ -265,6 +240,7 @@ def parse_release(release: dict[str, Any]) -> ReleaseInfo:
         download_url=pick_download_url(release),
         published_at=release.get("published_at") or "",
         prerelease=bool(release.get("prerelease")),
+        body=release.get("body") or "",
     )
 
 
@@ -275,18 +251,6 @@ def fetch_releases(config: Config) -> list[ReleaseInfo]:
     if config.include_prereleases:
         return parsed
     return [release for release in parsed if not release.prerelease]
-
-
-def fetch_npcap_info() -> NpcapInfo:
-    page = request_bytes(NPCAP_DOWNLOAD_PAGE).decode("utf-8", errors="replace")
-    parser = NpcapLinkParser()
-    parser.feed(page)
-
-    if not parser.matches:
-        raise RuntimeError("Could not find the Npcap installer link on npcap.com.")
-
-    version, href = parser.matches[0]
-    return NpcapInfo(version=version, installer_url=urljoin(NPCAP_DOWNLOAD_PAGE, href))
 
 
 def count_new_releases(releases: list[ReleaseInfo], previous_tag: str) -> int | None:
@@ -310,6 +274,39 @@ def format_update_line(previous_tag: str | None, latest_tag: str, update_count: 
     return f"업데이트: {previous} -> {latest} ({suffix})"
 
 
+def summarize_release_notes(body: str, *, max_chars: int = 1200) -> str:
+    if not body.strip():
+        return "패치노트가 등록되지 않았습니다."
+
+    lines: list[str] = []
+    previous_blank = False
+
+    for raw_line in body.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.strip()
+        if not line:
+            if lines and not previous_blank:
+                lines.append("")
+            previous_blank = True
+            continue
+
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = re.sub(r"\s+", " ", line)
+        lines.append(line)
+        previous_blank = False
+
+    summary = "\n".join(lines).strip()
+    if not summary:
+        return "패치노트가 등록되지 않았습니다."
+
+    if len(summary) <= max_chars:
+        return summary
+
+    suffix = "\n...\n자세한 내용은 릴리즈 노트를 확인해주세요."
+    if max_chars <= len(suffix):
+        return summary[: max(0, max_chars - 3)].rstrip() + "..."
+    return summary[: max_chars - len(suffix)].rstrip() + suffix
+
+
 def make_embed(title: str, release: ReleaseInfo, description: str) -> discord.Embed:
     embed = discord.Embed(
         title=title,
@@ -327,40 +324,59 @@ def build_update_embed(
     previous_tag: str | None,
     latest: ReleaseInfo,
     update_count: int | None,
-    npcap: NpcapInfo,
 ) -> discord.Embed:
     description = "\n".join(
         [
             format_update_line(previous_tag, latest.tag_name, update_count),
-            f"Waffle Meter: {latest.download_url}",
-            f"Npcap: {npcap.installer_url}",
+            f"설치 파일: {latest.download_url}",
+            f"릴리즈 노트: {latest.html_url}",
+            "",
+            "앱 내 자동 업데이트를 사용할 수 있습니다.",
+            '이미 설치되어 있다면 미터기 업데이트 알림에서 "지금 재시작"을 눌러 적용하세요.',
         ]
     )
-    return make_embed("Waffle Meter 업데이트 알림", latest, description)
+    embed = make_embed("Waffle Meter 업데이트 알림", latest, description)
+    embed.add_field(
+        name="패치노트",
+        value=summarize_release_notes(latest.body, max_chars=1000),
+        inline=False,
+    )
+    return embed
 
 
-def build_latest_embed(latest: ReleaseInfo, npcap: NpcapInfo) -> discord.Embed:
+def build_latest_embed(latest: ReleaseInfo) -> discord.Embed:
     description = "\n".join(
         [
             f"최신 버전: {normalize_version(latest.tag_name)}",
-            f"Waffle Meter: {latest.download_url}",
-            f"Npcap: {npcap.installer_url}",
+            f"설치 파일: {latest.download_url}",
+            f"릴리즈 노트: {latest.html_url}",
+            "",
+            "v2.0부터는 네이티브 WPF/.NET 버전입니다.",
+            "Npcap 별도 설치는 필요하지 않습니다.",
         ]
     )
-    return make_embed("Waffle Meter 최신 버전", latest, description)
+    embed = make_embed("Waffle Meter 최신 버전", latest, description)
+    embed.add_field(
+        name="최근 변경사항",
+        value=summarize_release_notes(latest.body, max_chars=700),
+        inline=False,
+    )
+    return embed
 
 
-def build_install_embed(latest: ReleaseInfo, npcap: NpcapInfo) -> discord.Embed:
+def build_install_embed(latest: ReleaseInfo) -> discord.Embed:
     description = "\n".join(
         [
-            f"Npcap: {npcap.installer_url}",
-            f"Waffle Meter: {latest.download_url}",
+            f"설치 파일: {latest.download_url}",
+            f"릴리즈 노트: {latest.html_url}",
             "",
-            "1. 링크 된 Npcap 을 우선 설치해주세요. 설치 중 "
-            "`Install Npcap in WinPcap API-compatible Mode` 옵션을 반드시 체크했는지 "
-            "확인해주세요. (A2power 사용 하던 사용자는 재설치 할 필요 없습니다.)",
-            "2. 제공된 Waffle Meter 링크로 msi 를 다운 받아 설치해주세요.",
-            "3. 설치완료 시 바탕화면에 바로가기 아이콘이 생성됩니다.",
+            "1. 위 설치 파일(`waffle_meter-win-Setup.exe`)을 다운로드해 실행합니다.",
+            '2. Windows SmartScreen 경고가 뜨면 "추가 정보" -> "실행"을 눌러 진행합니다.',
+            "3. 처음 실행할 때 패킷 캡처 권한 상승(UAC)이 한 번 표시됩니다.",
+            "4. 설치 후 시작 메뉴 또는 바탕화면의 waffle_meter 바로가기로 실행합니다.",
+            '5. 이후 업데이트는 앱에서 자동 확인하며, 알림에서 "지금 재시작"을 누르면 자동 적용됩니다.',
+            "",
+            "참고: v1.x MSI 사용자는 v2.0 설치 시 기존 버전이 자동 정리됩니다.",
         ]
     )
     return make_embed("Waffle Meter 설치방법", latest, description)
@@ -413,13 +429,13 @@ class WaffleMeterBot(discord.Client):
             await self.remember_notification_channel(interaction)
 
             try:
-                latest, npcap = await self.fetch_latest_with_npcap()
+                latest = await self.fetch_latest_release()
             except Exception as exc:
                 log(f"/최신버전 failed: {exc}")
                 await interaction.followup.send("최신 버전 정보를 가져오지 못했습니다.")
                 return
 
-            await interaction.followup.send(embed=build_latest_embed(latest, npcap))
+            await interaction.followup.send(embed=build_latest_embed(latest))
 
         @self.tree.command(name="설치방법", description="Waffle Meter 설치 링크와 설치 순서를 안내합니다.")
         async def install_guide(interaction: discord.Interaction) -> None:
@@ -427,13 +443,13 @@ class WaffleMeterBot(discord.Client):
             await self.remember_notification_channel(interaction)
 
             try:
-                latest, npcap = await self.fetch_latest_with_npcap()
+                latest = await self.fetch_latest_release()
             except Exception as exc:
                 log(f"/설치방법 failed: {exc}")
                 await interaction.followup.send("설치 정보를 가져오지 못했습니다.")
                 return
 
-            await interaction.followup.send(embed=build_install_embed(latest, npcap))
+            await interaction.followup.send(embed=build_install_embed(latest))
 
     async def remember_notification_channel(self, interaction: discord.Interaction) -> None:
         if interaction.guild_id is None or interaction.channel_id is None:
@@ -448,14 +464,11 @@ class WaffleMeterBot(discord.Client):
             f"{interaction.channel_id} for guild {interaction.guild_id}."
         )
 
-    async def fetch_latest_with_npcap(self) -> tuple[ReleaseInfo, NpcapInfo]:
-        releases, npcap = await asyncio.gather(
-            asyncio.to_thread(fetch_releases, self.config),
-            asyncio.to_thread(fetch_npcap_info),
-        )
+    async def fetch_latest_release(self) -> ReleaseInfo:
+        releases = await asyncio.to_thread(fetch_releases, self.config)
         if not releases:
             raise RuntimeError(f"No releases found for {self.config.repository}.")
-        return releases[0], npcap
+        return releases[0]
 
     async def update_loop(self) -> None:
         await self.wait_until_ready()
@@ -499,8 +512,7 @@ class WaffleMeterBot(discord.Client):
         update_count = (
             None if current_version is None else count_new_releases(releases, current_version)
         )
-        npcap = await asyncio.to_thread(fetch_npcap_info)
-        embed = build_update_embed(current_version, latest, update_count, npcap)
+        embed = build_update_embed(current_version, latest, update_count)
         sent_count = await self.broadcast_update(embed, channels)
 
         await asyncio.to_thread(self.store.write_current_version, latest.tag_name)
